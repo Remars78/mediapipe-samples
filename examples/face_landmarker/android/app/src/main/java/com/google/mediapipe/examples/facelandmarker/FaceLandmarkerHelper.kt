@@ -77,7 +77,7 @@ class FaceLandmarkerHelper(
                 .setMinTrackingConfidence(minFaceTrackingConfidence)
                 .setMinFacePresenceConfidence(minFacePresenceConfidence)
                 .setNumFaces(maxNumFaces)
-                .setOutputFaceBlendshapes(true) // ВАЖНО: Включено для моргания
+                .setOutputFaceBlendshapes(true) 
                 .setRunningMode(runningMode)
 
             if (runningMode == RunningMode.LIVE_STREAM) {
@@ -146,7 +146,7 @@ class FaceLandmarkerHelper(
         faceLandmarker?.detectAsync(mpImage, frameTime)
     }
 
-    // --- Методы для GalleryFragment (добавлены, чтобы не ломать сборку) ---
+    // --- SUPPORT FOR GALLERY FRAGMENT ---
     fun detectVideoFile(videoUri: Uri, inferenceIntervalMs: Long): VideoResultBundle? {
         if (runningMode != RunningMode.VIDEO) {
             throw IllegalArgumentException("Attempting to call detectVideoFile while not using RunningMode.VIDEO")
@@ -171,14 +171,17 @@ class FaceLandmarkerHelper(
         for (i in 0..numberOfFrameToRead) {
             val timestampMs = i * inferenceIntervalMs // ms
             retriever.getFrameAtTime(
-                timestampMs * 1000, // convert from ms to micro-s
+                timestampMs * 1000, 
                 MediaMetadataRetriever.OPTION_CLOSEST
             )?.let { frame ->
                 val argbBitmap =
                     if (frame.config == Bitmap.Config.ARGB_8888) frame
                     else frame.copy(Bitmap.Config.ARGB_8888, false)
                 val mpImage = BitmapImageBuilder(argbBitmap).build()
-                faceLandmarker?.detect(mpImage, timestampMs)?.let { detectionResult ->
+                
+                // !!! ИСПРАВЛЕНИЕ ЗДЕСЬ !!!
+                // Используем detectForVideo вместо detect
+                faceLandmarker?.detectForVideo(mpImage, timestampMs)?.let { detectionResult ->
                     resultList.add(detectionResult)
                 }
             } ?: run {
@@ -203,7 +206,6 @@ class FaceLandmarkerHelper(
         }
         return null
     }
-    // ---------------------------------------------------------------------
 
     private fun returnLivestreamResult(
         result: FaceLandmarkerResult,
@@ -230,8 +232,6 @@ class FaceLandmarkerHelper(
 
     companion object {
         const val TAG = "FaceLandmarkerHelper"
-        private const val MP_FACE_LANDMARKER_TASK = "face_landmarker.task"
-
         const val DELEGATE_CPU = 0
         const val DELEGATE_GPU = 1
         const val DEFAULT_FACE_DETECTION_CONFIDENCE = 0.5F
@@ -242,22 +242,23 @@ class FaceLandmarkerHelper(
         const val GPU_ERROR = 1
     }
 
-    data class ResultBundle(
-        val result: FaceLandmarkerResult,
-        val inferenceTime: Long,
-        val inputImageHeight: Int,
-        val inputImageWidth: Int,
-    )
-
-    data class VideoResultBundle(
-        val results: List<FaceLandmarkerResult>,
-        val inferenceTime: Long,
-        val inputImageHeight: Int,
-        val inputImageWidth: Int,
-    )
-
     interface LandmarkerListener {
         fun onError(error: String, errorCode: Int = OTHER_ERROR)
         fun onResults(resultBundle: ResultBundle)
     }
 }
+
+// --- TOP LEVEL DATA CLASSES ---
+data class ResultBundle(
+    val result: FaceLandmarkerResult,
+    val inferenceTime: Long,
+    val inputImageHeight: Int,
+    val inputImageWidth: Int,
+)
+
+data class VideoResultBundle(
+    val results: List<FaceLandmarkerResult>,
+    val inferenceTime: Long,
+    val inputImageHeight: Int,
+    val inputImageWidth: Int,
+)
