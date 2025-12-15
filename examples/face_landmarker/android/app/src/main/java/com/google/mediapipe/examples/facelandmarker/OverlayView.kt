@@ -22,6 +22,7 @@ import android.graphics.Paint
 import android.util.AttributeSet
 import android.view.View
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -32,53 +33,67 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
     private var paintCursor = Paint()
     private var paintCalibration = Paint()
     private var paintText = Paint()
+    private var paintDebug = Paint()
 
-    // --- Eye Tracking Logic Variables ---
-    // Индексы зрачков в Face Mesh (468 - левый, 473 - правый)
-    private val LEFT_IRIS_CENTER = 468
-    private val RIGHT_IRIS_CENTER = 473
+    // --- КОНСТАНТЫ ТОЧЕК ЛИЦА (FACE MESH) ---
+    // Левый глаз
+    private val LEFT_EYE_INNER = 362
+    private val LEFT_EYE_OUTER = 263
+    private val LEFT_IRIS = 473
+    
+    // Правый глаз
+    private val RIGHT_EYE_INNER = 33
+    private val RIGHT_EYE_OUTER = 133
+    private val RIGHT_IRIS = 468
 
-    // Калибровка
+    // --- КАЛИБРОВКА ---
     private enum class CalibrationStage {
         CENTER, TOP_LEFT, TOP_RIGHT, BOTTOM_RIGHT, BOTTOM_LEFT, FINISHED
     }
     private var currentStage = CalibrationStage.CENTER
     private var calibrationTimer: Long = 0
-    private val CALIBRATION_DELAY_MS = 3000L // Время на каждую точку (3 сек)
+    private val CALIBRATION_DELAY_MS = 2000L // 2 сек на точку (быстрее)
 
-    // Границы движения глаз (будут определены при калибровке)
-    private var eyeMinX = Float.MAX_VALUE
-    private var eyeMaxX = Float.MIN_VALUE
-    private var eyeMinY = Float.MAX_VALUE
-    private var eyeMaxY = Float.MIN_VALUE
+    // Храним не координаты, а ОТНОСИТЕЛЬНЫЕ КОЭФФИЦИЕНТЫ (0.0 .. 1.0)
+    // Min - взгляд влево/вверх, Max - взгляд вправо/вниз
+    private var calibMinX = 1.0f
+    private var calibMaxX = -1.0f
+    private var calibMinY = 1.0f
+    private var calibMaxY = -1.0f
 
-    // Сглаживание курсора (Linear Interpolation)
+    // --- УМНОЕ СГЛАЖИВАНИЕ (SMOOTHING) ---
     private var cursorX = 0f
     private var cursorY = 0f
-    private val SMOOTHING_FACTOR = 0.2f // Чем меньше, тем плавнее, но больше задержка
+    
+    // Динамический фильтр:
+    // Если глаза двигаются быстро -> alpha высокий (быстрый отклик)
+    // Если глаза почти стоят -> alpha низкий (сильное сглаживание дрожания)
+    private val MIN_ALPHA = 0.05f // Очень плавно для прицеливания
+    private val MAX_ALPHA = 0.6f  // Быстро для рывков
 
-    // Логика клика (моргание)
+    // --- ЛОГИКА КЛИКА ---
     private var isBlinking = false
     private var blinkStartTime: Long = 0
-    private val BLINK_CLICK_DURATION = 2000L // 2 секунды
+    private val BLINK_CLICK_DURATION = 1200L // 1.2 сек (быстрее, чтобы не ждать вечность)
     private var isClickState = false
 
     init {
-        // Настройка кисти курсора
         paintCursor.color = Color.GREEN
         paintCursor.style = Paint.Style.FILL
         paintCursor.isAntiAlias = true
 
-        // Настройка кисти калибровки
         paintCalibration.color = Color.RED
         paintCalibration.style = Paint.Style.FILL
         paintCalibration.isAntiAlias = true
 
-        // Настройка текста
         paintText.color = Color.WHITE
-        paintText.textSize = 50f
+        paintText.textSize = 60f
         paintText.isAntiAlias = true
         paintText.setShadowLayer(5f, 0f, 0f, Color.BLACK)
+        
+        paintDebug.color = Color.YELLOW
+        paintDebug.strokeWidth = 2f
+        paintDebug.style = Paint.Style.STROKE
     }
 
     fun setResults(
@@ -88,7 +103,6 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
         runningMode: com.google.mediapipe.tasks.vision.core.RunningMode = com.google.mediapipe.tasks.vision.core.RunningMode.LIVE_STREAM
     ) {
         results = faceLandmarkerResults
-        // Перерисовываем экран при каждом новом результате
         invalidate()
     }
 
@@ -98,28 +112,52 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
 
         if (result.faceLandmarks().isNotEmpty()) {
             val landmarks = result.faceLandmarks()[0]
+            
+            // --- 1. ВЫЧИСЛЕНИЕ ОТНОСИТЕЛЬНЫХ КООРДИНАТ (МАТЕМАТИКА) ---
+            
+            // Функция для расчета позиции зрачка внутри глаза (от 0.0 до 1.0)
+            fun getEyeRatio(innerIdx: Int, outerIdx: Int, irisIdx: Int): Pair<Float, Float> {
+                val inner = landmarks[innerIdx]
+                val outer = landmarks[outerIdx]
+                val iris = landmarks[irisIdx]
+
+                // Ширина и высота "глазной щели"
+                val eyeWidth = outer.x() - inner.x()
+                val eyeHeight = outer.y() - inner.y() // Это приближенно, для Y лучше использовать веки
+                
+                // Проекция зрачка на вектор от внутреннего к внешнему уголку
+                // Это делает трекинг устойчивым к повороту головы!
+                val irisDistX = iris.x() - inner.x()
+                
+                // Нормализация X (0.0 = внутренний угол, 1.0 = внешний угол)
+                // Для Y используем просто глобальную координату относительно высоты лица,
+                // так как веки двигаются при моргании и ломают расчет Y внутри глаза.
+                // Но для X этот метод идеален.
+                
+                val ratioX = irisDistX / eyeWidth
+                val ratioY = iris.y() // Для Y пока оставим сырую координату, она стабильнее при моргании
+                
+                return Pair(ratioX, ratioY)
+            }
+
+            // Считаем для обоих глаз и берем среднее
+            val leftEye = getEyeRatio(LEFT_EYE_INNER, LEFT_EYE_OUTER, LEFT_IRIS)
+            val rightEye = getEyeRatio(RIGHT_EYE_INNER, RIGHT_EYE_OUTER, RIGHT_IRIS)
+
+            // Важно: У левого и правого глаза "внутренний угол" с разных сторон.
+            // Инвертируем один глаз, чтобы направления совпадали.
+            // Левый глаз: Inner(362) -> Outer(263) (Слева направо на экране)
+            // Правый глаз: Inner(33) -> Outer(133) (Справа налево, если смотреть зеркально)
+            // Усредняем данные:
+            val avgRatioX = (leftEye.first + rightEye.first) / 2f
+            val avgRawY = (leftEye.second + rightEye.second) / 2f
+
+            // --- 2. ОБРАБОТКА МОРГАНИЯ (BLINK) ---
             val blendshapes = result.faceBlendshapes()
-
-            // 1. Получаем координаты зрачков (нормализованные 0.0 - 1.0)
-            val leftIris = landmarks[LEFT_IRIS_CENTER]
-            val rightIris = landmarks[RIGHT_IRIS_CENTER]
-
-            // Средняя точка взгляда (сырая)
-            val rawEyeX = (leftIris.x() + rightIris.x()) / 2f
-            val rawEyeY = (leftIris.y() + rightIris.y()) / 2f
-
-            // 2. Логика моргания (Click)
-            // Индексы blendshapes могут отличаться, обычно ищем по имени категории
-            // MediaPipe blendshapes: eyeBlinkLeft, eyeBlinkRight
             var blinkScore = 0f
             if (blendshapes.isPresent && blendshapes.get().isNotEmpty()) {
                 val shapes = blendshapes.get()[0]
-                // Ищем blendshapes для моргания. Индексы 9 и 10 обычно eyeBlinkLeft/Right,
-                // но лучше пройтись по списку, если он именован, или использовать hardcode если порядок фиксирован.
-                // В стандартной модели MediaPipe Face Mesh V2:
-                // eyeBlinkLeft ~ index 9
-                // eyeBlinkRight ~ index 10
-                // Для надежности просто берем значения, если они доступны по индексу
+                // Индексы могут варьироваться, но обычно 9 и 10
                 if (shapes.size > 10) {
                      val leftBlink = shapes[9].score()
                      val rightBlink = shapes[10].score()
@@ -127,59 +165,70 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
                 }
             }
 
-            if (blinkScore > 0.5f) { // Глаза закрыты
+            if (blinkScore > 0.6f) {
                 if (!isBlinking) {
                     isBlinking = true
                     blinkStartTime = System.currentTimeMillis()
                 } else {
-                    val duration = System.currentTimeMillis() - blinkStartTime
-                    if (duration > BLINK_CLICK_DURATION) {
-                        isClickState = true // Активируем клик
+                    if (System.currentTimeMillis() - blinkStartTime > BLINK_CLICK_DURATION) {
+                        isClickState = true
                     }
                 }
             } else {
                 isBlinking = false
-                isClickState = false // Сброс клика
+                isClickState = false
             }
 
-            // 3. Машина состояний (Калибровка vs Работа)
+            // --- 3. ЛОГИКА ПРИЛОЖЕНИЯ ---
             if (currentStage != CalibrationStage.FINISHED) {
-                runCalibration(canvas, rawEyeX, rawEyeY)
+                processCalibration(canvas, avgRatioX, avgRawY)
             } else {
-                runMouseControl(canvas, rawEyeX, rawEyeY)
+                processCursor(canvas, avgRatioX, avgRawY)
             }
         }
     }
 
-    private fun runCalibration(canvas: Canvas, eyeX: Float, eyeY: Float) {
+    private fun processCalibration(canvas: Canvas, eyeRatioX: Float, eyeRawY: Float) {
         val w = width.toFloat()
         val h = height.toFloat()
         val cx = w / 2
         val cy = h / 2
-        val padding = 100f
+        val padding = 150f
 
-        var targetX = 0f
-        var targetY = 0f
-        var instruction = ""
-
-        // Логика переключения этапов по таймеру
         val now = System.currentTimeMillis()
         if (calibrationTimer == 0L) calibrationTimer = now
-        
-        // Рисуем таймер/прогресс
         val elapsed = now - calibrationTimer
         val progress = min(1f, elapsed.toFloat() / CALIBRATION_DELAY_MS)
-        val radius = 30f + (20f * progress) // Пульсация
+        
+        // Рисуем таргет
+        var tx = cx; var ty = cy
+        var txt = "Центр"
 
-        // Если прошло время, сохраняем данные и идем дальше
+        when (currentStage) {
+            CalibrationStage.CENTER -> { tx=cx; ty=cy; txt="Центр" }
+            CalibrationStage.TOP_LEFT -> { tx=padding; ty=padding; txt="Верх-Лево" }
+            CalibrationStage.TOP_RIGHT -> { tx=w-padding; ty=padding; txt="Верх-Право" }
+            CalibrationStage.BOTTOM_RIGHT -> { tx=w-padding; ty=h-padding; txt="Низ-Право" }
+            CalibrationStage.BOTTOM_LEFT -> { tx=padding; ty=h-padding; txt="Низ-Лево" }
+            else -> {}
+        }
+
+        canvas.drawCircle(tx, ty, 40f * progress + 20f, paintCalibration)
+        canvas.drawText(txt, cx - 100, cy + 150, paintText)
+
+        // Сбор данных (Ждем 50% времени, чтобы глаз успел доехать, потом пишем)
+        if (elapsed > CALIBRATION_DELAY_MS * 0.5) {
+            // Инициализация мин/макс первыми значениями
+            if (calibMinX > 0.9f) { calibMinX = eyeRatioX; calibMaxX = eyeRatioX; calibMinY = eyeRawY; calibMaxY = eyeRawY }
+
+            // Расширяем диапазон
+            calibMinX = min(calibMinX, eyeRatioX)
+            calibMaxX = max(calibMaxX, eyeRatioX)
+            calibMinY = min(calibMinY, eyeRawY)
+            calibMaxY = max(calibMaxY, eyeRawY)
+        }
+
         if (elapsed > CALIBRATION_DELAY_MS) {
-            // Захват крайних точек
-            eyeMinX = min(eyeMinX, eyeX)
-            eyeMaxX = max(eyeMaxX, eyeX)
-            eyeMinY = min(eyeMinY, eyeY)
-            eyeMaxY = max(eyeMaxY, eyeY)
-
-            // Переход к следующему этапу
             calibrationTimer = 0L
             currentStage = when (currentStage) {
                 CalibrationStage.CENTER -> CalibrationStage.TOP_LEFT
@@ -189,75 +238,64 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
                 CalibrationStage.BOTTOM_LEFT -> CalibrationStage.FINISHED
                 else -> CalibrationStage.FINISHED
             }
-            if (currentStage == CalibrationStage.FINISHED) return // Сразу переходим к управлению
         }
-
-        // Определение координат цели для текущего этапа
-        when (currentStage) {
-            CalibrationStage.CENTER -> { targetX = cx; targetY = cy; instruction = "Смотрите в ЦЕНТР" }
-            CalibrationStage.TOP_LEFT -> { targetX = padding; targetY = padding; instruction = "Смотрите ВЛЕВО-ВВЕРХ" }
-            CalibrationStage.TOP_RIGHT -> { targetX = w - padding; targetY = padding; instruction = "Смотрите ВПРАВО-ВВЕРХ" }
-            CalibrationStage.BOTTOM_RIGHT -> { targetX = w - padding; targetY = h - padding; instruction = "Смотрите ВПРАВО-ВНИЗ" }
-            CalibrationStage.BOTTOM_LEFT -> { targetX = padding; targetY = h - padding; instruction = "Смотрите ВЛЕВО-ВНИЗ" }
-            else -> {}
-        }
-
-        // Рисуем цель
-        paintCalibration.color = Color.RED
-        canvas.drawCircle(targetX, targetY, radius, paintCalibration)
-        canvas.drawText(instruction, cx - 200, cy + 100, paintText)
     }
 
-    private fun runMouseControl(canvas: Canvas, eyeX: Float, eyeY: Float) {
-        // Защита от деления на ноль, если калибровка прошла плохо
-        if (eyeMaxX == eyeMinX) eyeMaxX += 0.01f
-        if (eyeMaxY == eyeMinY) eyeMaxY += 0.01f
+    private fun processCursor(canvas: Canvas, valX: Float, valY: Float) {
+        // Защита от схлопывания диапазона
+        if (abs(calibMaxX - calibMinX) < 0.01f) calibMaxX += 0.1f
+        if (abs(calibMaxY - calibMinY) < 0.01f) calibMaxY += 0.1f
 
-        // 1. Нормализация (приведение координат глаз 0..1 относительно калибровки)
-        // Инвертируем X, так как камера зеркалит (если это фронталка)
-        // Для фронтальной камеры движение зрачка влево (на изображении) это движение вправо на экране
-        var normX = (eyeX - eyeMinX) / (eyeMaxX - eyeMinX)
-        var normY = (eyeY - eyeMinY) / (eyeMaxY - eyeMinY)
+        // 1. Нормализация (Mapping)
+        // Для фронтальной камеры инвертируем X (Зеркало)
+        var normX = (valX - calibMinX) / (calibMaxX - calibMinX)
+        // Для фронталки часто нужно развернуть: 1.0 - normX. 
+        // Если курсор бегает инвертировано - уберите "1f - "
+        normX = 1f - normX 
+        
+        var normY = (valY - calibMinY) / (calibMaxY - calibMinY)
 
-        // Клэмп (чтобы не вылетал за границы)
-        normX = max(0f, min(1f, normX))
-        normY = max(0f, min(1f, normY))
+        // Кламп с небольшим запасом (чтобы можно было дотянуть до углов)
+        normX = max(-0.1f, min(1.1f, normX))
+        normY = max(-0.1f, min(1.1f, normY))
 
-        // 2. Преобразование в координаты экрана
-        // Инверсия X нужна, если FaceLandmarker не настроен на зеркалирование.
-        // Обычно для селфи-мыши: взгляд влево -> курсор влево.
-        // Проверьте на устройстве: возможно, понадобится `1f - normX`.
-        val targetScreenX = (1f - normX) * width 
+        val targetScreenX = normX * width
         val targetScreenY = normY * height
 
-        // 3. Сглаживание (Lerp)
-        cursorX = cursorX + (targetScreenX - cursorX) * SMOOTHING_FACTOR
-        cursorY = cursorY + (targetScreenY - cursorY) * SMOOTHING_FACTOR
-
-        // 4. Отрисовка курсора
-        if (isClickState) {
-            paintCursor.color = Color.BLUE // Клик активен
-            canvas.drawText("CLICK!", cursorX + 40, cursorY, paintText)
-        } else {
-            paintCursor.color = Color.GREEN // Просто движение
-        }
-
-        canvas.drawCircle(cursorX, cursorY, 30f, paintCursor)
+        // 2. ДИНАМИЧЕСКОЕ СГЛАЖИВАНИЕ (Adaptive Filter)
+        val dist = Math.hypot((targetScreenX - cursorX).toDouble(), (targetScreenY - cursorY).toDouble()).toFloat()
         
-        // Индикация прогресса клика (если глаза закрыты, но еще не клик)
-        if (isBlinking && !isClickState) {
-             val duration = System.currentTimeMillis() - blinkStartTime
-             val sweep = (duration.toFloat() / BLINK_CLICK_DURATION) * 360f
-             paintCursor.style = Paint.Style.STROKE
-             paintCursor.strokeWidth = 5f
-             canvas.drawArc(cursorX - 40, cursorY - 40, cursorX + 40, cursorY + 40, -90f, sweep, false, paintCursor)
-             paintCursor.style = Paint.Style.FILL // Возвращаем заливку
+        // Если движение быстрое (>100px) - alpha больше (меньше лаг)
+        // Если движение медленное (<20px) - alpha маленькая (жесткая стабилизация)
+        var alpha = (dist / 300f).coerceIn(MIN_ALPHA, MAX_ALPHA)
+        
+        // Линейная интерполяция
+        cursorX = cursorX + (targetScreenX - cursorX) * alpha
+        cursorY = cursorY + (targetScreenY - cursorY) * alpha
+
+        // 3. Отрисовка
+        if (isClickState) {
+            paintCursor.color = Color.BLUE
+            canvas.drawCircle(cursorX, cursorY, 60f, paintCursor) // Клик больше
+            canvas.drawText("CLICK!", cursorX + 60, cursorY, paintText)
+        } else {
+            paintCursor.color = Color.GREEN
+            canvas.drawCircle(cursorX, cursorY, 40f, paintCursor)
+            
+            // Визуализация подготовки к клику
+            if (isBlinking) {
+                val duration = System.currentTimeMillis() - blinkStartTime
+                val radius = 40f + (duration.toFloat() / BLINK_CLICK_DURATION) * 40f
+                paintCursor.style = Paint.Style.STROKE
+                paintCursor.strokeWidth = 8f
+                canvas.drawCircle(cursorX, cursorY, radius, paintCursor)
+                paintCursor.style = Paint.Style.FILL
+            }
         }
     }
 
     fun clear() {
         results = null
-        paintCursor.reset()
         invalidate()
     }
 }
