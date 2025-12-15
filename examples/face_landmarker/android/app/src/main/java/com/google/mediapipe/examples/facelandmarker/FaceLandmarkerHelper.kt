@@ -18,7 +18,8 @@ package com.google.mediapipe.examples.facelandmarker
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
-import android.media.ExifInterface
+import android.media.MediaMetadataRetriever
+import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.VisibleForTesting
@@ -76,8 +77,7 @@ class FaceLandmarkerHelper(
                 .setMinTrackingConfidence(minFaceTrackingConfidence)
                 .setMinFacePresenceConfidence(minFacePresenceConfidence)
                 .setNumFaces(maxNumFaces)
-                // !!! ВАЖНО: Включаем Blendshapes для детекции моргания !!!
-                .setOutputFaceBlendshapes(true) 
+                .setOutputFaceBlendshapes(true) // ВАЖНО: Включено для моргания
                 .setRunningMode(runningMode)
 
             if (runningMode == RunningMode.LIVE_STREAM) {
@@ -146,6 +146,65 @@ class FaceLandmarkerHelper(
         faceLandmarker?.detectAsync(mpImage, frameTime)
     }
 
+    // --- Методы для GalleryFragment (добавлены, чтобы не ломать сборку) ---
+    fun detectVideoFile(videoUri: Uri, inferenceIntervalMs: Long): VideoResultBundle? {
+        if (runningMode != RunningMode.VIDEO) {
+            throw IllegalArgumentException("Attempting to call detectVideoFile while not using RunningMode.VIDEO")
+        }
+        val startTime = SystemClock.uptimeMillis()
+        var didErrorOccurred = false
+
+        val retriever = MediaMetadataRetriever()
+        retriever.setDataSource(context, videoUri)
+        val videoLengthMs =
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong()
+
+        val firstFrame = retriever.getFrameAtTime(0)
+        val width = firstFrame?.width
+        val height = firstFrame?.height
+
+        if ((videoLengthMs == null) || (width == null) || (height == null)) return null
+
+        val resultList = mutableListOf<FaceLandmarkerResult>()
+        val numberOfFrameToRead = videoLengthMs.div(inferenceIntervalMs)
+
+        for (i in 0..numberOfFrameToRead) {
+            val timestampMs = i * inferenceIntervalMs // ms
+            retriever.getFrameAtTime(
+                timestampMs * 1000, // convert from ms to micro-s
+                MediaMetadataRetriever.OPTION_CLOSEST
+            )?.let { frame ->
+                val argbBitmap =
+                    if (frame.config == Bitmap.Config.ARGB_8888) frame
+                    else frame.copy(Bitmap.Config.ARGB_8888, false)
+                val mpImage = BitmapImageBuilder(argbBitmap).build()
+                faceLandmarker?.detect(mpImage, timestampMs)?.let { detectionResult ->
+                    resultList.add(detectionResult)
+                }
+            } ?: run {
+                didErrorOccurred = true
+                faceLandmarkerHelperListener?.onError("Frame at $timestampMs could not be retrieved")
+            }
+        }
+        retriever.release()
+        val inferenceTimePerFrameMs = (SystemClock.uptimeMillis() - startTime).div(numberOfFrameToRead)
+        return if (didErrorOccurred) null else VideoResultBundle(resultList, inferenceTimePerFrameMs, height, width)
+    }
+
+    fun detectImage(image: Bitmap): ResultBundle? {
+        if (runningMode != RunningMode.IMAGE) {
+            throw IllegalArgumentException("Attempting to call detectImage while not using RunningMode.IMAGE")
+        }
+        val startTime = SystemClock.uptimeMillis()
+        val mpImage = BitmapImageBuilder(image).build()
+        faceLandmarker?.detect(mpImage)?.let { result ->
+            val inferenceTime = SystemClock.uptimeMillis() - startTime
+            return ResultBundle(result, inferenceTime, image.height, image.width)
+        }
+        return null
+    }
+    // ---------------------------------------------------------------------
+
     private fun returnLivestreamResult(
         result: FaceLandmarkerResult,
         input: MPImage
@@ -185,6 +244,13 @@ class FaceLandmarkerHelper(
 
     data class ResultBundle(
         val result: FaceLandmarkerResult,
+        val inferenceTime: Long,
+        val inputImageHeight: Int,
+        val inputImageWidth: Int,
+    )
+
+    data class VideoResultBundle(
+        val results: List<FaceLandmarkerResult>,
         val inferenceTime: Long,
         val inputImageHeight: Int,
         val inputImageWidth: Int,
