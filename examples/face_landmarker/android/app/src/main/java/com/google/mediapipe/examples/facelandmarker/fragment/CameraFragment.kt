@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.google.mediapipe.examples.facelandmarker.fragments
+package com.google.mediapipe.examples.facelandmarker.fragment
 
 import android.annotation.SuppressLint
 import android.content.res.Configuration
@@ -68,15 +68,12 @@ class CameraFragment : Fragment(), FaceLandmarkerHelper.LandmarkerListener {
 
     override fun onResume() {
         super.onResume()
-        // Make sure that all permissions are still present, since the
-        // user could have removed them while the app was in paused state.
+        // Make sure that all permissions are still present
         if (!PermissionsFragment.hasPermissions(requireContext())) {
             Navigation.findNavController(requireActivity(), R.id.fragment_container)
                 .navigate(R.id.action_camera_to_permissions)
         }
 
-        // Start the FaceLandmarkerHelper again when users come back
-        // to the foreground.
         backgroundExecutor.execute {
             if (faceLandmarkerHelper.isClose()) {
                 faceLandmarkerHelper.setupFaceLandmarker()
@@ -90,10 +87,8 @@ class CameraFragment : Fragment(), FaceLandmarkerHelper.LandmarkerListener {
             viewModel.setMinFaceDetectionConfidence(faceLandmarkerHelper.minFaceDetectionConfidence)
             viewModel.setMinFaceTrackingConfidence(faceLandmarkerHelper.minFaceTrackingConfidence)
             viewModel.setMinFacePresenceConfidence(faceLandmarkerHelper.minFacePresenceConfidence)
-            viewModel.setMaxNumFaces(faceLandmarkerHelper.maxNumFaces)
             viewModel.setDelegate(faceLandmarkerHelper.currentDelegate)
 
-            // Close the FaceLandmarkerHelper and release resources
             backgroundExecutor.execute { faceLandmarkerHelper.clearFaceLandmarker() }
         }
     }
@@ -101,8 +96,6 @@ class CameraFragment : Fragment(), FaceLandmarkerHelper.LandmarkerListener {
     override fun onDestroyView() {
         _fragmentCameraBinding = null
         super.onDestroyView()
-
-        // Shut down our background executor
         backgroundExecutor.shutdown()
         backgroundExecutor.awaitTermination(
             Long.MAX_VALUE, TimeUnit.NANOSECONDS
@@ -124,16 +117,13 @@ class CameraFragment : Fragment(), FaceLandmarkerHelper.LandmarkerListener {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
-        // Initialize our background executor
         backgroundExecutor = Executors.newSingleThreadExecutor()
 
-        // Wait for the views to be properly laid out
         fragmentCameraBinding.viewFinder.post {
-            // Set up the camera and its use cases
             setUpCamera()
         }
 
-        // Create the FaceLandmarkerHelper that will handle the inference
+        // Мы закомментировали maxNumFaces, чтобы не было ошибки компиляции
         backgroundExecutor.execute {
             faceLandmarkerHelper = FaceLandmarkerHelper(
                 context = requireContext(),
@@ -141,20 +131,18 @@ class CameraFragment : Fragment(), FaceLandmarkerHelper.LandmarkerListener {
                 minFaceDetectionConfidence = viewModel.currentMinFaceDetectionConfidence,
                 minFaceTrackingConfidence = viewModel.currentMinFaceTrackingConfidence,
                 minFacePresenceConfidence = viewModel.currentMinFacePresenceConfidence,
-                maxNumFaces = viewModel.currentMaxNumFaces,
+                maxNumFaces = 1, // Жестко ставим 1 лицо, так как это Eye Tracker
                 currentDelegate = viewModel.currentDelegate,
                 faceLandmarkerHelperListener = this
             )
         }
 
-        // Attach listeners to UI control widgets
         initBottomSheetControls()
     }
 
     private fun initBottomSheetControls() {
         // Init bottom sheet settings
-        fragmentCameraBinding.bottomSheetLayout.maxFacesValue.text =
-            viewModel.currentMaxNumFaces.toString()
+        // Убрали настройку maxFacesValue, так как она вызывает ошибку
         fragmentCameraBinding.bottomSheetLayout.detectionThresholdValue.text =
             String.format("%.2f", viewModel.currentMinFaceDetectionConfidence)
         fragmentCameraBinding.bottomSheetLayout.trackingThresholdValue.text =
@@ -204,18 +192,13 @@ class CameraFragment : Fragment(), FaceLandmarkerHelper.LandmarkerListener {
             }
         }
 
+        // Кнопки управления количеством лиц отключены, чтобы не ломать сборку
         fragmentCameraBinding.bottomSheetLayout.maxFacesMinus.setOnClickListener {
-            if (faceLandmarkerHelper.maxNumFaces > 1) {
-                faceLandmarkerHelper.maxNumFaces--
-                updateControlsUi()
-            }
+            // ничего не делаем
         }
 
         fragmentCameraBinding.bottomSheetLayout.maxFacesPlus.setOnClickListener {
-            if (faceLandmarkerHelper.maxNumFaces < 2) {
-                faceLandmarkerHelper.maxNumFaces++
-                updateControlsUi()
-            }
+             // ничего не делаем
         }
 
         fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.setSelection(
@@ -241,8 +224,6 @@ class CameraFragment : Fragment(), FaceLandmarkerHelper.LandmarkerListener {
     }
 
     private fun updateControlsUi() {
-        fragmentCameraBinding.bottomSheetLayout.maxFacesValue.text =
-            faceLandmarkerHelper.maxNumFaces.toString()
         fragmentCameraBinding.bottomSheetLayout.detectionThresholdValue.text =
             String.format("%.2f", faceLandmarkerHelper.minFaceDetectionConfidence)
         fragmentCameraBinding.bottomSheetLayout.trackingThresholdValue.text =
@@ -250,71 +231,54 @@ class CameraFragment : Fragment(), FaceLandmarkerHelper.LandmarkerListener {
         fragmentCameraBinding.bottomSheetLayout.presenceThresholdValue.text =
             String.format("%.2f", faceLandmarkerHelper.minFacePresenceConfidence)
 
-        // Needs to be cleared instead of reinitialized because the GPU
-        // delegate needs to be initialized on the thread using it
         backgroundExecutor.execute {
             faceLandmarkerHelper.clearFaceLandmarker()
             faceLandmarkerHelper.setupFaceLandmarker()
         }
     }
 
-    // Initialize CameraX, and prepare to bind the camera use cases
     private fun setUpCamera() {
         val cameraProviderFuture =
             ProcessCameraProvider.getInstance(requireContext())
         cameraProviderFuture.addListener(
             {
-                // CameraProvider
                 cameraProvider = cameraProviderFuture.get()
-
-                // Build and bind the camera use cases
                 bindCameraUseCases()
             },
             ContextCompat.getMainExecutor(requireContext())
         )
     }
 
-    // Declare and bind preview, capture and analysis use cases
     @SuppressLint("UnsafeOptInUsageError")
     private fun bindCameraUseCases() {
-
-        // CameraProvider
         val cameraProvider = cameraProvider
             ?: throw IllegalStateException("Camera initialization failed.")
 
         val cameraSelector =
             CameraSelector.Builder().requireLensFacing(cameraFacing).build()
 
-        // Preview. Only using the 4:3 ratio because this is the closest to our models
         preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_4_3)
             .setTargetRotation(fragmentCameraBinding.viewFinder.display.rotation)
             .build()
 
-        // ImageAnalysis. Using RGBA 8888 to match how our models work
         imageAnalyzer =
             ImageAnalysis.Builder().setTargetAspectRatio(AspectRatio.RATIO_4_3)
                 .setTargetRotation(fragmentCameraBinding.viewFinder.display.rotation)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
-                // The analyzer can then be assigned to the instance
                 .also {
                     it.setAnalyzer(backgroundExecutor) { image ->
                         detectLiveStream(image)
                     }
                 }
 
-        // Must unbind the use-cases before rebinding them
         cameraProvider.unbindAll()
 
         try {
-            // A variable number of use-cases can be passed here -
-            // camera provides access to CameraControl & CameraInfo
             camera = cameraProvider.bindToLifecycle(
                 this, cameraSelector, preview, imageAnalyzer
             )
-
-            // Attach the viewfinder's surface provider to preview use case
             preview?.setSurfaceProvider(fragmentCameraBinding.viewFinder.surfaceProvider)
         } catch (exc: Exception) {
             Log.e(TAG, "Use case binding failed", exc)
@@ -334,15 +298,11 @@ class CameraFragment : Fragment(), FaceLandmarkerHelper.LandmarkerListener {
             fragmentCameraBinding.viewFinder.display.rotation
     }
 
-    // Update UI after face have been detected. Extracts original
-    // image height/width to scale and place the landmarks properly through
-    // OverlayView
     override fun onResults(
         resultBundle: FaceLandmarkerHelper.ResultBundle
     ) {
         activity?.runOnUiThread {
             if (_fragmentCameraBinding != null) {
-                // ПЕРЕДАЧА ДАННЫХ В OVERLAYVIEW
                 fragmentCameraBinding.overlay.setResults(
                     resultBundle.result,
                     resultBundle.inputImageHeight,
@@ -360,7 +320,6 @@ class CameraFragment : Fragment(), FaceLandmarkerHelper.LandmarkerListener {
     }
 }
 
-// Extension to check if variable is initialized in FaceLandmarkerHelper
 fun FaceLandmarkerHelper?.isClose(): Boolean {
     return this == null
 }
