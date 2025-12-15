@@ -179,8 +179,7 @@ class FaceLandmarkerHelper(
                     else frame.copy(Bitmap.Config.ARGB_8888, false)
                 val mpImage = BitmapImageBuilder(argbBitmap).build()
                 
-                // !!! ИСПРАВЛЕНИЕ ЗДЕСЬ !!!
-                // Используем detectForVideo вместо detect
+                // Исправлено: используем detectForVideo
                 faceLandmarker?.detectForVideo(mpImage, timestampMs)?.let { detectionResult ->
                     resultList.add(detectionResult)
                 }
@@ -230,6 +229,22 @@ class FaceLandmarkerHelper(
         )
     }
 
+    // --- ВНУТРЕННИЕ КЛАССЫ (DATA CLASSES) ---
+    // Они должны быть внутри, чтобы GalleryFragment и CameraFragment их видели
+    data class ResultBundle(
+        val result: FaceLandmarkerResult,
+        val inferenceTime: Long,
+        val inputImageHeight: Int,
+        val inputImageWidth: Int,
+    )
+
+    data class VideoResultBundle(
+        val results: List<FaceLandmarkerResult>,
+        val inferenceTime: Long,
+        val inputImageHeight: Int,
+        val inputImageWidth: Int,
+    )
+
     companion object {
         const val TAG = "FaceLandmarkerHelper"
         const val DELEGATE_CPU = 0
@@ -247,18 +262,3 @@ class FaceLandmarkerHelper(
         fun onResults(resultBundle: ResultBundle)
     }
 }
-
-// --- TOP LEVEL DATA CLASSES ---
-data class ResultBundle(
-    val result: FaceLandmarkerResult,
-    val inferenceTime: Long,
-    val inputImageHeight: Int,
-    val inputImageWidth: Int,
-)
-
-data class VideoResultBundle(
-    val results: List<FaceLandmarkerResult>,
-    val inferenceTime: Long,
-    val inputImageHeight: Int,
-    val inputImageWidth: Int,
-)
