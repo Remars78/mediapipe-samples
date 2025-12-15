@@ -51,8 +51,8 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
         CENTER, TOP_LEFT, TOP_RIGHT, BOTTOM_RIGHT, BOTTOM_LEFT, FINISHED
     }
     private var currentStage = CalibrationStage.CENTER
-    private var calibrationTimer: Long = 0
-    private val CALIBRATION_DELAY_MS = 2000L // 2 сек на точку (быстрее)
+    // private var calibrationTimer: Long = 0 // УБРАЛИ ТАЙМЕР
+    // private val CALIBRATION_DELAY_MS = 2000L 
 
     // Храним не координаты, а ОТНОСИТЕЛЬНЫЕ КОЭФФИЦИЕНТЫ (0.0 .. 1.0)
     // Min - взгляд влево/вверх, Max - взгляд вправо/вниз
@@ -66,15 +66,14 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
     private var cursorY = 0f
     
     // Динамический фильтр:
-    // Если глаза двигаются быстро -> alpha высокий (быстрый отклик)
-    // Если глаза почти стоят -> alpha низкий (сильное сглаживание дрожания)
-    private val MIN_ALPHA = 0.05f // Очень плавно для прицеливания
-    private val MAX_ALPHA = 0.6f  // Быстро для рывков
+    private val MIN_ALPHA = 0.05f 
+    private val MAX_ALPHA = 0.6f  
 
-    // --- ЛОГИКА КЛИКА ---
+    // --- ЛОГИКА КЛИКА/ПЕРЕХОДА ---
     private var isBlinking = false
     private var blinkStartTime: Long = 0
-    private val BLINK_CLICK_DURATION = 1200L // 1.2 сек (быстрее, чтобы не ждать вечность)
+    private val BLINK_CLICK_DURATION = 1200L // 1.2 сек для КЛИКА
+    private val BLINK_CALIB_DURATION = 800L // 0.8 сек для ПЕРЕХОДА НА СЛЕД. ЭТАП
     private var isClickState = false
 
     init {
@@ -115,40 +114,23 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
             
             // --- 1. ВЫЧИСЛЕНИЕ ОТНОСИТЕЛЬНЫХ КООРДИНАТ (МАТЕМАТИКА) ---
             
-            // Функция для расчета позиции зрачка внутри глаза (от 0.0 до 1.0)
             fun getEyeRatio(innerIdx: Int, outerIdx: Int, irisIdx: Int): Pair<Float, Float> {
                 val inner = landmarks[innerIdx]
                 val outer = landmarks[outerIdx]
                 val iris = landmarks[irisIdx]
 
-                // Ширина и высота "глазной щели"
                 val eyeWidth = outer.x() - inner.x()
-                val eyeHeight = outer.y() - inner.y() // Это приближенно, для Y лучше использовать веки
-                
-                // Проекция зрачка на вектор от внутреннего к внешнему уголку
-                // Это делает трекинг устойчивым к повороту головы!
                 val irisDistX = iris.x() - inner.x()
                 
-                // Нормализация X (0.0 = внутренний угол, 1.0 = внешний угол)
-                // Для Y используем просто глобальную координату относительно высоты лица,
-                // так как веки двигаются при моргании и ломают расчет Y внутри глаза.
-                // Но для X этот метод идеален.
-                
                 val ratioX = irisDistX / eyeWidth
-                val ratioY = iris.y() // Для Y пока оставим сырую координату, она стабильнее при моргании
+                val ratioY = iris.y() 
                 
                 return Pair(ratioX, ratioY)
             }
 
-            // Считаем для обоих глаз и берем среднее
             val leftEye = getEyeRatio(LEFT_EYE_INNER, LEFT_EYE_OUTER, LEFT_IRIS)
             val rightEye = getEyeRatio(RIGHT_EYE_INNER, RIGHT_EYE_OUTER, RIGHT_IRIS)
 
-            // Важно: У левого и правого глаза "внутренний угол" с разных сторон.
-            // Инвертируем один глаз, чтобы направления совпадали.
-            // Левый глаз: Inner(362) -> Outer(263) (Слева направо на экране)
-            // Правый глаз: Inner(33) -> Outer(133) (Справа налево, если смотреть зеркально)
-            // Усредняем данные:
             val avgRatioX = (leftEye.first + rightEye.first) / 2f
             val avgRawY = (leftEye.second + rightEye.second) / 2f
 
@@ -157,7 +139,6 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
             var blinkScore = 0f
             if (blendshapes.isPresent && blendshapes.get().isNotEmpty()) {
                 val shapes = blendshapes.get()[0]
-                // Индексы могут варьироваться, но обычно 9 и 10
                 if (shapes.size > 10) {
                      val leftBlink = shapes[9].score()
                      val rightBlink = shapes[10].score()
@@ -169,11 +150,8 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
                 if (!isBlinking) {
                     isBlinking = true
                     blinkStartTime = System.currentTimeMillis()
-                } else {
-                    if (System.currentTimeMillis() - blinkStartTime > BLINK_CLICK_DURATION) {
-                        isClickState = true
-                    }
                 }
+                // Логика перехода и клика будет разной в зависимости от режима
             } else {
                 isBlinking = false
                 isClickState = false
@@ -196,47 +174,63 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
         val padding = 150f
 
         val now = System.currentTimeMillis()
-        if (calibrationTimer == 0L) calibrationTimer = now
-        val elapsed = now - calibrationTimer
-        val progress = min(1f, elapsed.toFloat() / CALIBRATION_DELAY_MS)
         
-        // Рисуем таргет
+        // --- РИСОВАНИЕ ЦЕЛИ И ИНСТРУКЦИИ ---
         var tx = cx; var ty = cy
         var txt = "Центр"
+        var instruction = "Смотрите и моргните (0.8 сек)"
 
         when (currentStage) {
-            CalibrationStage.CENTER -> { tx=cx; ty=cy; txt="Центр" }
-            CalibrationStage.TOP_LEFT -> { tx=padding; ty=padding; txt="Верх-Лево" }
-            CalibrationStage.TOP_RIGHT -> { tx=w-padding; ty=padding; txt="Верх-Право" }
-            CalibrationStage.BOTTOM_RIGHT -> { tx=w-padding; ty=h-padding; txt="Низ-Право" }
-            CalibrationStage.BOTTOM_LEFT -> { tx=padding; ty=h-padding; txt="Низ-Лево" }
+            CalibrationStage.CENTER -> { tx=cx; ty=cy; txt="1. Центр" }
+            CalibrationStage.TOP_LEFT -> { tx=padding; ty=padding; txt="2. Верх-Лево" }
+            CalibrationStage.TOP_RIGHT -> { tx=w-padding; ty=padding; txt="3. Верх-Право" }
+            CalibrationStage.BOTTOM_RIGHT -> { tx=w-padding; ty=h-padding; txt="4. Низ-Право" }
+            CalibrationStage.BOTTOM_LEFT -> { tx=padding; ty=h-padding; txt="5. Низ-Лево" }
             else -> {}
         }
+        
+        // Рисуем цель
+        canvas.drawCircle(tx, ty, 60f, paintCalibration)
+        canvas.drawText(txt, cx - 150, cy + 150, paintText)
+        canvas.drawText(instruction, cx - 350, cy + 220, paintText)
+        
+        // Визуализация прогресса моргания
+        if (isBlinking) {
+            val elapsed = now - blinkStartTime
+            val progress = elapsed.toFloat() / BLINK_CALIB_DURATION
+            val radius = 60f + progress * 40f
+            
+            paintCalibration.style = Paint.Style.STROKE
+            paintCalibration.strokeWidth = 12f
+            canvas.drawCircle(tx, ty, radius, paintCalibration)
+            paintCalibration.style = Paint.Style.FILL // Вернуть заливку
 
-        canvas.drawCircle(tx, ty, 40f * progress + 20f, paintCalibration)
-        canvas.drawText(txt, cx - 100, cy + 150, paintText)
+            // --- СБОР И ПЕРЕХОД ---
+            if (elapsed > BLINK_CALIB_DURATION) {
+                // Сбор данных
+                if (calibMinX > 0.9f) { calibMinX = eyeRatioX; calibMaxX = eyeRatioX; calibMinY = eyeRawY; calibMaxY = eyeRawY }
 
-        // Сбор данных (Ждем 50% времени, чтобы глаз успел доехать, потом пишем)
-        if (elapsed > CALIBRATION_DELAY_MS * 0.5) {
-            // Инициализация мин/макс первыми значениями
-            if (calibMinX > 0.9f) { calibMinX = eyeRatioX; calibMaxX = eyeRatioX; calibMinY = eyeRawY; calibMaxY = eyeRawY }
-
-            // Расширяем диапазон
-            calibMinX = min(calibMinX, eyeRatioX)
-            calibMaxX = max(calibMaxX, eyeRatioX)
-            calibMinY = min(calibMinY, eyeRawY)
-            calibMaxY = max(calibMaxY, eyeRawY)
-        }
-
-        if (elapsed > CALIBRATION_DELAY_MS) {
-            calibrationTimer = 0L
-            currentStage = when (currentStage) {
-                CalibrationStage.CENTER -> CalibrationStage.TOP_LEFT
-                CalibrationStage.TOP_LEFT -> CalibrationStage.TOP_RIGHT
-                CalibrationStage.TOP_RIGHT -> CalibrationStage.BOTTOM_RIGHT
-                CalibrationStage.BOTTOM_RIGHT -> CalibrationStage.BOTTOM_LEFT
-                CalibrationStage.BOTTOM_LEFT -> CalibrationStage.FINISHED
-                else -> CalibrationStage.FINISHED
+                calibMinX = min(calibMinX, eyeRatioX)
+                calibMaxX = max(calibMaxX, eyeRatioX)
+                calibMinY = min(calibMinY, eyeRawY)
+                calibMaxY = max(calibMaxY, eyeRawY)
+                
+                // Переход к следующему этапу
+                currentStage = when (currentStage) {
+                    CalibrationStage.CENTER -> CalibrationStage.TOP_LEFT
+                    CalibrationStage.TOP_LEFT -> CalibrationStage.TOP_RIGHT
+                    CalibrationStage.TOP_RIGHT -> CalibrationStage.BOTTOM_RIGHT
+                    CalibrationStage.BOTTOM_RIGHT -> CalibrationStage.BOTTOM_LEFT
+                    CalibrationStage.BOTTOM_LEFT -> CalibrationStage.FINISHED
+                    else -> CalibrationStage.FINISHED
+                }
+                // Сброс моргания для нового этапа
+                isBlinking = false
+                blinkStartTime = 0L
+                
+                if (currentStage == CalibrationStage.FINISHED) {
+                     canvas.drawText("КАЛИБРОВКА ЗАВЕРШЕНА!", cx - 400, cy, paintText)
+                }
             }
         }
     }
@@ -247,15 +241,12 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
         if (abs(calibMaxY - calibMinY) < 0.01f) calibMaxY += 0.1f
 
         // 1. Нормализация (Mapping)
-        // Для фронтальной камеры инвертируем X (Зеркало)
         var normX = (valX - calibMinX) / (calibMaxX - calibMinX)
-        // Для фронталки часто нужно развернуть: 1.0 - normX. 
-        // Если курсор бегает инвертировано - уберите "1f - "
         normX = 1f - normX 
         
         var normY = (valY - calibMinY) / (calibMaxY - calibMinY)
 
-        // Кламп с небольшим запасом (чтобы можно было дотянуть до углов)
+        // Кламп с небольшим запасом 
         normX = max(-0.1f, min(1.1f, normX))
         normY = max(-0.1f, min(1.1f, normY))
 
@@ -265,19 +256,23 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
         // 2. ДИНАМИЧЕСКОЕ СГЛАЖИВАНИЕ (Adaptive Filter)
         val dist = Math.hypot((targetScreenX - cursorX).toDouble(), (targetScreenY - cursorY).toDouble()).toFloat()
         
-        // Если движение быстрое (>100px) - alpha больше (меньше лаг)
-        // Если движение медленное (<20px) - alpha маленькая (жесткая стабилизация)
         var alpha = (dist / 300f).coerceIn(MIN_ALPHA, MAX_ALPHA)
         
-        // Линейная интерполяция
         cursorX = cursorX + (targetScreenX - cursorX) * alpha
         cursorY = cursorY + (targetScreenY - cursorY) * alpha
 
         // 3. Отрисовка
+        if (isBlinking) {
+            val duration = System.currentTimeMillis() - blinkStartTime
+            if (duration > BLINK_CLICK_DURATION) {
+                isClickState = true
+            }
+        }
+        
         if (isClickState) {
             paintCursor.color = Color.BLUE
-            canvas.drawCircle(cursorX, cursorY, 60f, paintCursor) // Клик больше
-            canvas.drawText("CLICK!", cursorX + 60, cursorY, paintText)
+            canvas.drawCircle(cursorX, cursorY, 60f, paintCursor) 
+            canvas.drawText("КЛИК", cursorX + 60, cursorY, paintText)
         } else {
             paintCursor.color = Color.GREEN
             canvas.drawCircle(cursorX, cursorY, 40f, paintCursor)
@@ -296,6 +291,12 @@ class OverlayView(context: Context?, attrs: AttributeSet?) :
 
     fun clear() {
         results = null
+        // При сбросе можно сбросить и калибровку, если нужно
+        // currentStage = CalibrationStage.CENTER 
+        // calibMinX = 1.0f 
+        // calibMaxX = -1.0f
+        // calibMinY = 1.0f 
+        // calibMaxY = -1.0f 
         invalidate()
     }
 }
